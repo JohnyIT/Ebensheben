@@ -1,0 +1,134 @@
+#!/bin/bash
+# Скрипт установки и настройки OpenVPN на Ubuntu 20.04-24.04
+
+# Обновление системы
+sudo apt update && sudo apt upgrade -y
+
+# Установка OpenVPN и Easy-RSA
+sudo apt install -y openvpn easy-rsa
+
+# Создание директории для сертификатов
+make-cadir ~/openvpn-ca
+cd ~/openvpn-ca
+
+# Настройка Easy-RSA
+cp /usr/share/easy-rsa/* ~/openvpn-ca/
+chmod +x vars
+source vars
+
+# Инициализация PKI и создание CA
+./easyrsa init-pki
+./easyrsa build-ca nopass
+
+# Создание серверного ключа и сертификата
+./easyrsa gen-req server nopass
+./easyrsa sign-req server server
+
+# Создание ключа Diffie-Hellman
+./easyrsa gen-dh
+
+# Генерация TLS-ключа
+openvpn --genkey --secret ta.key
+
+# Создание клиентского сертификата
+./easyrsa gen-req client1 nopass
+./easyrsa sign-req client client1
+
+# Копирование сертификатов в /etc/openvpn
+sudo cp pki/ca.crt pki/private/server.key pki/issued/server.crt ta.key pki/dh.pem /etc/openvpn/
+
+# Создание конфигурационного файла сервера
+sudo tee /etc/openvpn/server/server.conf > /dev/null <<EOL
+port 1194
+proto udp
+dev tun
+ca ca.crt
+cert server.crt
+key server.key
+dh dh.pem
+tls-auth ta.key 0
+cipher AES-128-CBC
+auth SHA256
+server 10.8.0.0 255.255.255.0
+ifconfig-pool-persist ipp.txt
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 1.1.1.1"
+push "dhcp-option DNS 1.0.0.1"
+keepalive 10 120
+user nobody
+group nogroup
+persist-key
+persist-tun
+status openvpn-status.log
+log /var/log/openvpn.log
+verb 3
+EOL
+
+# Включение маршрутизации
+sudo sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+sudo sysctl -p
+
+# Настройка UFW
+sudo tee -a /etc/ufw/before.rules > /dev/null <<EOL
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s 10.8.0.0/8 -o eth0 -j MASQUERADE
+COMMIT
+EOL
+
+sudo sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+
+sudo ufw allow 1194/udp
+sudo ufw allow OpenSSH
+sudo ufw disable
+sudo ufw enable
+
+# Запуск и активация OpenVPN
+sudo systemctl start openvpn@server
+sudo systemctl enable openvpn@server
+
+# Создание конфигурации клиента
+mkdir -p ~/client-configs/files
+chmod 700 ~/client-configs/files
+
+cat > ~/client-configs/base.conf <<EOL
+client
+dev tun
+proto udp
+remote YOUR_SERVER_IP 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-128-CBC
+auth SHA256
+key-direction 1
+verb 3
+EOL
+
+cat > ~/client-configs/make_config.sh <<EOL
+#!/bin/bash
+KEY_DIR=~/openvpn-ca/pki
+OUTPUT_DIR=~/client-configs/files
+BASE_CONFIG=~/client-configs/base.conf
+cat \${BASE_CONFIG} \
+    <(echo -e '<ca>') \
+    \${KEY_DIR}/ca.crt \
+    <(echo -e '</ca>\n<cert>') \
+    \${KEY_DIR}/issued/\${1}.crt \
+    <(echo -e '</cert>\n<key>') \
+    \${KEY_DIR}/private/\${1}.key \
+    <(echo -e '</key>\n<tls-auth>') \
+    ~/openvpn-ca/ta.key \
+    <(echo -e '</tls-auth>') \
+    > \${OUTPUT_DIR}/\${1}.ovpn
+EOL
+
+chmod +x ~/client-configs/make_config.sh
+
+# Создание первого клиента
+cd ~/client-configs/
+./make_config.sh client1
+
+echo "OpenVPN успешно настроен!"
